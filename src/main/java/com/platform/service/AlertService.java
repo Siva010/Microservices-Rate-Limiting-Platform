@@ -21,6 +21,9 @@ public class AlertService {
         log.warn("Publishing alert to Kafka: {}", message);
         reactor.core.publisher.Mono.fromRunnable(() -> kafkaTemplate.send(alertTopic, key, message))
                 .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
-                .subscribe();
+                .subscribe(
+                        null,
+                        error -> log.error("Failed to publish rate limit alert to Kafka", error)
+                );
     }
 }
