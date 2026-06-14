@@ -19,6 +19,8 @@ public class AlertService {
     public void publishRateLimitExceededAlert(String routeId, String key) {
         String message = String.format("Rate limit exceeded for route: %s, key: %s", routeId, key);
         log.warn("Publishing alert to Kafka: {}", message);
-        kafkaTemplate.send(alertTopic, key, message);
+        reactor.core.publisher.Mono.fromRunnable(() -> kafkaTemplate.send(alertTopic, key, message))
+                .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
+                .subscribe();
     }
 }
