@@ -35,8 +35,14 @@ public class CustomRateLimiterGatewayFilterFactory extends AbstractGatewayFilter
                 routeId = "unknown_route";
             }
             
-            // In a real application, you might use IP address or user ID. For demo, we use IP.
-            String key = exchange.getRequest().getRemoteAddress().getAddress().getHostAddress();
+            String key = exchange.getRequest().getHeaders().getFirst("X-Forwarded-For");
+            if (key == null || key.isEmpty()) {
+                if (exchange.getRequest().getRemoteAddress() != null && exchange.getRequest().getRemoteAddress().getAddress() != null) {
+                    key = exchange.getRequest().getRemoteAddress().getAddress().getHostAddress();
+                } else {
+                    key = "unknown";
+                }
+            }
 
             return rateLimiterService.isAllowed(routeId, key, config.getReplenishRate(), config.getBurstCapacity())
                     .flatMap(allowed -> {
