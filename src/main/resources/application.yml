@@ -13,22 +13,29 @@ spring:
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.apache.kafka.common.serialization.StringSerializer
+    consumer:
+      group-id: rate-limit-platform
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
   cloud:
     gateway:
-      routes:
-        - id: dummy-service
-          uri: http://httpbin.org:80
-          predicates:
-            - Path=/api/**
-          filters:
-            - name: CustomRateLimiter
-              args:
-                replenishRate: 10
-                burstCapacity: 20
-            - name: CircuitBreaker
-              args:
-                name: gatewayCircuitBreaker
-                fallbackUri: forward:/fallback
+      discovery:
+        locator:
+          enabled: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+  metrics:
+    export:
+      prometheus:
+        enabled: true
 
 resilience4j:
   circuitbreaker:
@@ -40,5 +47,12 @@ resilience4j:
         waitDurationInOpenState: 10000
 
 rate-limiter:
+  fail-open: false
+  trust-forwarded-headers: false
+  admin-api-key: ${ADMIN_API_KEY:changeme}
   kafka:
     topic: rate-limit-alerts
+    alert-debounce-seconds: 60
+  jwt:
+    enabled: true
+    secret: ${JWT_SECRET:demo-secret-key-change-in-production-min-32-chars}

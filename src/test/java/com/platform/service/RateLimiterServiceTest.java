@@ -1,6 +1,6 @@
 package com.platform.service;
 
-import org.junit.jupiter.api.BeforeEach;
+import com.platform.config.RateLimiterProperties;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
@@ -14,10 +14,13 @@ import reactor.test.StepVerifier;
 import java.util.Arrays;
 import java.util.List;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.*;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
 class RateLimiterServiceTest {
@@ -26,66 +29,89 @@ class RateLimiterServiceTest {
     private ReactiveStringRedisTemplate redisTemplate;
 
     @Mock
-    private RedisScript<List> script;
+    private RedisScript<List<Long>> script;
 
     @Mock
     private AlertService alertService;
 
+    @Mock
+    private RateLimiterProperties properties;
+
     @InjectMocks
     private RateLimiterService rateLimiterService;
 
-    @BeforeEach
-    void setUp() {
-    }
-
     @Test
-    void isAllowed_WhenRedisReturnsAllowed_ShouldReturnTrueAndNotAlert() {
-        // Arrange
-        List<Long> mockResponse = Arrays.asList(1L, 10L); // 1 = allowed, 10 = remaining tokens
+    void checkRateLimit_WhenRedisReturnsAllowed_ShouldReturnAllowedAndNotAlert() {
+        List<Long> mockResponse = Arrays.asList(1L, 10L);
         when(redisTemplate.execute(eq(script), anyList(), anyList()))
                 .thenReturn(Flux.just(mockResponse));
 
-        // Act
-        var result = rateLimiterService.isAllowed("test-route", "127.0.0.1", 10, 20);
-
-        // Assert
-        StepVerifier.create(result)
-                .expectNext(true)
+        StepVerifier.create(rateLimiterService.checkRateLimit(
+                        "route-a:tenant-a:client-a", 10, 20, "route-a", "tenant-a", "client-a"))
+                .assertNext(result -> {
+                    assertThat(result.allowed()).isTrue();
+                    assertThat(result.remainingTokens()).isEqualTo(10L);
+                })
                 .verifyComplete();
 
-        verify(alertService, never()).publishRateLimitExceededAlert(any(), any());
+        verify(alertService, never()).publishRateLimitExceededAlert(any(), any(), any());
     }
 
     @Test
-    void isAllowed_WhenRedisReturnsNotAllowed_ShouldReturnFalseAndAlert() {
-        // Arrange
-        List<Long> mockResponse = Arrays.asList(0L, 0L); // 0 = not allowed, 0 = remaining tokens
+    void checkRateLimit_WhenRedisReturnsNotAllowed_ShouldReturnDeniedAndAlert() {
+        List<Long> mockResponse = Arrays.asList(0L, 0L);
         when(redisTemplate.execute(eq(script), anyList(), anyList()))
                 .thenReturn(Flux.just(mockResponse));
 
-        // Act
-        var result = rateLimiterService.isAllowed("test-route", "127.0.0.1", 10, 20);
-
-        // Assert
-        StepVerifier.create(result)
-                .expectNext(false)
+        StepVerifier.create(rateLimiterService.checkRateLimit(
+                        "route-a:tenant-a:client-a", 10, 20, "route-a", "tenant-a", "client-a"))
+                .assertNext(result -> assertThat(result.allowed()).isFalse())
                 .verifyComplete();
 
-        verify(alertService).publishRateLimitExceededAlert("test-route", "127.0.0.1");
+        verify(alertService).publishRateLimitExceededAlert("route-a", "tenant-a", "client-a");
     }
 
     @Test
-    void isAllowed_WhenRedisThrowsException_ShouldReturnTrueFailOpen() {
-        // Arrange
+    void checkRateLimit_WhenRedisThrowsException_ShouldFailClosedByDefault() {
+        when(properties.isFailOpen()).thenReturn(false);
         when(redisTemplate.execute(eq(script), anyList(), anyList()))
                 .thenReturn(Flux.error(new RuntimeException("Redis timeout")));
 
-        // Act
-        var result = rateLimiterService.isAllowed("test-route", "127.0.0.1", 10, 20);
-
-        // Assert
-        StepVerifier.create(result)
-                .expectNext(true) // fail-open
+        StepVerifier.create(rateLimiterService.checkRateLimit(
+                        "route-a:tenant-a:client-a", 10, 20, "route-a", "tenant-a", "client-a"))
+                .assertNext(result -> assertThat(result.allowed()).isFalse())
                 .verifyComplete();
+    }
+
+    @Test
+    void checkRateLimit_WhenRedisThrowsExceptionAndFailOpenEnabled_ShouldAllow() {
+        when(properties.isFailOpen()).thenReturn(true);
+        when(redisTemplate.execute(eq(script), anyList(), anyList()))
+                .thenReturn(Flux.error(new RuntimeException("Redis timeout")));
+
+        StepVerifier.create(rateLimiterService.checkRateLimit(
+                        "route-a:tenant-a:client-a", 10, 20, "route-a", "tenant-a", "client-a"))
+                .assertNext(result -> assertThat(result.allowed()).isTrue())
+                .verifyComplete();
+    }
+
+    @Test
+    void checkRateLimit_WithInvalidConfig_ShouldDenyWithoutCallingRedis() {
+        StepVerifier.create(rateLimiterService.checkRateLimit(
+                        "route-a:tenant-a:client-a", 0, 20, "route-a", "tenant-a", "client-a"))
+                .assertNext(result -> assertThat(result.allowed()).isFalse())
+                .verifyComplete();
+
+        verify(redisTemplate, never()).execute(any(), anyList(), anyList());
+    }
+
+    @Test
+    void getKeys_ShouldUseCompositeRateLimitKey() {
+        List<String> keys = RateLimiterService.getKeys("dummy-service:acme:10.0.0.1");
+
+        assertThat(keys).containsExactly(
+                "request_rate_limiter.{dummy-service:acme:10.0.0.1}.tokens",
+                "request_rate_limiter.{dummy-service:acme:10.0.0.1}.timestamp"
+        );
     }
 }

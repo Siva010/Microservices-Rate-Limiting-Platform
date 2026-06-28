@@ -6,6 +6,10 @@ local capacity = tonumber(ARGV[2])
 local now = tonumber(ARGV[3])
 local requested = tonumber(ARGV[4])
 
+if rate == nil or capacity == nil or rate <= 0 or capacity <= 0 then
+  return { 0, 0 }
+end
+
 local fill_time = capacity/rate
 local ttl = math.max(1, math.floor(fill_time*2))
 

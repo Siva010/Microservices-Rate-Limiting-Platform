@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rate Limiting Platform Dashboard</title>
+    <style>
+        :root { color-scheme: light dark; font-family: Inter, Segoe UI, sans-serif; }
+        body { margin: 0; background: #0f172a; color: #e2e8f0; }
+        .wrap { max-width: 1100px; margin: 0 auto; padding: 2rem; }
+        h1 { margin-bottom: 0.25rem; }
+        .sub { color: #94a3b8; margin-bottom: 2rem; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
+        .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1.25rem; }
+        .metric { font-size: 2rem; font-weight: 700; }
+        .label { color: #94a3b8; font-size: 0.9rem; }
+        table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+        th, td { text-align: left; padding: 0.75rem; border-bottom: 1px solid #334155; }
+        th { color: #94a3b8; font-weight: 600; }
+        .warn { color: #fbbf24; }
+        button { background: #2563eb; color: white; border: 0; border-radius: 8px; padding: 0.6rem 1rem; cursor: pointer; }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <h1>Rate Limiting Platform</h1>
+    <p class="sub">Live metrics and recent rate-limit incidents</p>
+    <button onclick="refresh()">Refresh</button>
+    <div class="grid" style="margin-top:1rem;">
+        <div class="card"><div class="metric" id="tenants">-</div><div class="label">Tenants</div></div>
+        <div class="card"><div class="metric" id="services">-</div><div class="label">Services</div></div>
+        <div class="card"><div class="metric" id="policies">-</div><div class="label">Policies</div></div>
+        <div class="card"><div class="metric" id="allowed">-</div><div class="label">Allowed (total)</div></div>
+        <div class="card"><div class="metric" id="denied">-</div><div class="label">Denied (total)</div></div>
+    </div>
+    <div class="card" style="margin-top:1.5rem;">
+        <h2>Recent Alerts</h2>
+        <table>
+            <thead><tr><th>Time</th><th>Route</th><th>Tenant</th><th>Client</th><th>Severity</th><th>Message</th></tr></thead>
+            <tbody id="alerts"></tbody>
+        </table>
+    </div>
+</div>
+<script>
+async function refresh() {
+    const summary = await fetch('/platform/api/metrics/summary').then(r => r.json());
+    document.getElementById('tenants').textContent = summary.tenantCount;
+    document.getElementById('services').textContent = summary.serviceCount;
+    document.getElementById('policies').textContent = summary.policyCount;
+    document.getElementById('allowed').textContent = Math.round(summary.allowedTotal || 0);
+    document.getElementById('denied').textContent = Math.round(summary.deniedTotal || 0);
+    const tbody = document.getElementById('alerts');
+    tbody.innerHTML = '';
+    (summary.recentAlerts || []).forEach(alert => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${new Date(alert.timestamp).toLocaleString()}</td>
+            <td>${alert.routeId}</td><td>${alert.tenantId}</td><td>${alert.clientId}</td>
+            <td class="warn">${alert.severity}</td><td>${alert.message}</td>`;
+        tbody.appendChild(tr);
+    });
+}
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>
