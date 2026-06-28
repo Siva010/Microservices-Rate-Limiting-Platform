@@ -45,7 +45,7 @@ You can spin up the entire infrastructure and your application by executing:
 docker-compose up --build -d
 ```
 This will start:
-- **Zookeeper** on port `2181`
-- **Kafka** on port `9092`
+- **Kafka (KRaft)** on port `9092` — no Zookeeper required
 - **Redis** on port `6379`
+- **Mock API** (local demo downstream)
 - **API Gateway** on port `8080`
