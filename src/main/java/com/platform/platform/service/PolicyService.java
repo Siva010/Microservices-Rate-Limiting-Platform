@@ -7,8 +7,11 @@ import com.platform.platform.model.ServiceDefinition;
 import com.platform.platform.model.Tenant;
 import com.platform.platform.store.PlatformRedisStore;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.event.EventListener;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Mono;
 
 import java.util.List;
@@ -18,6 +21,7 @@ import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class PolicyService {
 
     private final PlatformRedisStore store;
@@ -27,16 +31,19 @@ public class PolicyService {
     private volatile List<RateLimitPolicy> policies = List.of();
 
     public Mono<ResolvedPolicy> resolvePolicy(String routeId, String tenantId) {
-        return refreshIfEmpty().then(Mono.fromSupplier(() -> resolveFromCache(routeId, tenantId)));
+        return refreshIfEmpty()
+                .doOnError(e -> log.debug("Non-fatal error during policy cache refresh for route {}: {}", routeId, e.getMessage()))
+                .onErrorResume(e -> Mono.empty())
+                .then(Mono.fromSupplier(() -> resolveFromCache(routeId, tenantId)));
     }
 
     public Mono<RateLimitPolicy> createPolicy(RateLimitPolicy policy) {
-        return store.savePolicy(policy);
+        return validatePolicy(policy).then(Mono.defer(() -> store.savePolicy(policy)));
     }
 
     public Mono<RateLimitPolicy> updatePolicy(String id, RateLimitPolicy updated) {
         updated.setId(id);
-        return store.savePolicy(updated);
+        return validatePolicy(updated).then(Mono.defer(() -> store.savePolicy(updated)));
     }
 
     public Mono<Boolean> deletePolicy(String id) {
@@ -54,7 +61,10 @@ public class PolicyService {
     @EventListener
     public void onConfigChanged(PlatformConfigChangedEvent event) {
         if (List.of("tenant", "service", "policy").contains(event.entityType())) {
-            refreshCache().subscribe();
+            refreshCache()
+                    .doOnError(e -> log.warn("Async cache refresh on config change failed", e))
+                    .onErrorResume(e -> Mono.empty())
+                    .subscribe(v -> {}, e -> log.warn("Cache refresh subscription error", e));  // ensure errors logged even in subscribe
         }
     }
 
@@ -63,6 +73,26 @@ public class PolicyService {
             return refreshCache();
         }
         return Mono.empty();
+    }
+
+    private Mono<Void> validatePolicy(RateLimitPolicy policy) {
+        if (policy.getRouteId() == null || policy.getRouteId().isBlank()) {
+            return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "routeId is required for policy"));
+        }
+        if (policy.getReplenishRate() <= 0 || policy.getBurstCapacity() <= 0) {
+            return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "replenishRate and burstCapacity must be positive"));
+        }
+        return store.findAllServices()
+                .filter(s -> s.getId() != null && s.getId().equals(policy.getRouteId()))
+                .hasElements()
+                .flatMap(hasService -> {
+                    if (hasService) {
+                        return Mono.empty();
+                    }
+                    return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                            "No registered service found for routeId: " + policy.getRouteId() +
+                            ". Register the service first via /platform/admin/services"));
+                });
     }
 
     public Mono<Void> refreshCache() {
@@ -76,7 +106,10 @@ public class PolicyService {
             tenantsById = tuple.getT2().stream()
                     .collect(Collectors.toMap(Tenant::getId, t -> t, (a, b) -> a, ConcurrentHashMap::new));
             policies = tuple.getT3();
-        }).then();
+        })
+        .doOnError(e -> log.warn("Failed to refresh policy/service/tenant cache from Redis, keeping previous snapshot", e))
+        .onErrorResume(e -> Mono.empty())
+        .then();
     }
 
     private ResolvedPolicy resolveFromCache(String routeId, String tenantId) {

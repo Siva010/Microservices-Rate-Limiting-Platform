@@ -15,6 +15,9 @@ import org.springframework.stereotype.Component;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.UUID;
 
@@ -67,32 +70,92 @@ public class PlatformRedisStore {
     }
 
     public Mono<ApiKeyRecord> saveApiKey(ApiKeyRecord record) {
-        return write(API_KEY_KEY + record.getKey(), record)
+        String raw = record.getKey();
+        if (raw == null || raw.isBlank()) {
+            return Mono.error(new IllegalArgumentException("API key value is required"));
+        }
+        String hash = hashApiKey(raw);
+
+        // Persist with opaque (hashed) value in the record to avoid storing plaintext secret
+        ApiKeyRecord toStore = ApiKeyRecord.builder()
+                .key(hash)
+                .tenantId(record.getTenantId())
+                .name(record.getName())
+                .enabled(record.isEnabled())
+                .build();
+
+        String storageRef = API_KEY_KEY + hash;
+        return write(storageRef, toStore)
                 .then(redisTemplate.opsForSet()
-                        .add(API_KEYS_BY_TENANT + record.getTenantId(), record.getKey()).then())
+                        .add(API_KEYS_BY_TENANT + record.getTenantId(), hash).then())
                 .then(Mono.fromRunnable(() -> eventPublisher.publishEvent(
-                        new PlatformConfigChangedEvent("apikey", record.getKey()))))
-                .thenReturn(record);
+                        new PlatformConfigChangedEvent("apikey", hash))))
+                .thenReturn(record);  // return original (with raw) to caller for create response
     }
 
-    public Mono<ApiKeyRecord> findApiKey(String key) {
-        return read(API_KEY_KEY + key, ApiKeyRecord.class);
+    public Mono<ApiKeyRecord> findApiKey(String providedKey) {
+        if (providedKey == null || providedKey.isBlank()) {
+            return Mono.empty();
+        }
+        // Always compute hash; support legacy (keys stored under their raw value) + modern (stored under hash)
+        String asHash = hashApiKey(providedKey);
+        // Try legacy path first (providedKey may be an old raw value used as storage suffix)
+        return read(API_KEY_KEY + providedKey, ApiKeyRecord.class)
+                .onErrorResume(e -> Mono.empty())
+                .switchIfEmpty(read(API_KEY_KEY + asHash, ApiKeyRecord.class));
+    }
+
+    /**
+     * Find by the *stored* identifier (hash or legacy raw). Used internally by tenant listing.
+     */
+    private Mono<ApiKeyRecord> findByStorageId(String storageId) {
+        if (storageId == null || storageId.isBlank()) return Mono.empty();
+        return read(API_KEY_KEY + storageId, ApiKeyRecord.class).onErrorResume(e -> Mono.empty());
     }
 
     public Flux<ApiKeyRecord> findApiKeysByTenant(String tenantId) {
         return redisTemplate.opsForSet().members(API_KEYS_BY_TENANT + tenantId)
-                .flatMap(key -> findApiKey(key).onErrorResume(e -> Mono.empty()));
+                .flatMap(this::findByStorageId)
+                .map(this::maskKeyForAdminList);  // never return raw; lists show opaque id
     }
 
-    public Mono<Boolean> deleteApiKey(String key, String tenantId) {
-        return redisTemplate.opsForSet().remove(API_KEYS_BY_TENANT + tenantId, key)
-                .then(redisTemplate.delete(API_KEY_KEY + key))
-                .map(count -> count > 0)
+    private ApiKeyRecord maskKeyForAdminList(ApiKeyRecord rec) {
+        if (rec == null || rec.getKey() == null) return rec;
+        String k = rec.getKey();
+        if (k.length() <= 8) return rec;
+        // For admin list responses, show only the stored identifier (hash) or a masked view
+        String display = k.substring(0, 4) + "****" + k.substring(k.length() - 4);
+        return ApiKeyRecord.builder()
+                .key(display)
+                .tenantId(rec.getTenantId())
+                .name(rec.getName())
+                .enabled(rec.isEnabled())
+                .build();
+    }
+
+    public Mono<Boolean> deleteApiKey(String keyOrId, String tenantId) {
+        String hash = hashApiKey(keyOrId);
+        // Try treating param as already-hashed id (from lists), fallback to hashed raw
+        return tryDeleteApiKeyEntry(tenantId, keyOrId)
+                .flatMap(deleted -> {
+                    if (Boolean.TRUE.equals(deleted)) {
+                        return Mono.just(true);
+                    }
+                    return tryDeleteApiKeyEntry(tenantId, hash);
+                })
                 .doOnNext(deleted -> {
                     if (Boolean.TRUE.equals(deleted)) {
-                        eventPublisher.publishEvent(new PlatformConfigChangedEvent("apikey", key));
+                        // Always publish the safe hash identifier, never raw secret
+                        eventPublisher.publishEvent(new PlatformConfigChangedEvent("apikey", hash));
                     }
                 });
+    }
+
+    private Mono<Boolean> tryDeleteApiKeyEntry(String tenantId, String storageId) {
+        if (storageId == null) return Mono.just(false);
+        return redisTemplate.opsForSet().remove(API_KEYS_BY_TENANT + tenantId, storageId)
+                .then(redisTemplate.delete(API_KEY_KEY + storageId))
+                .map(count -> count > 0);
     }
 
     public Mono<ServiceDefinition> saveService(ServiceDefinition service) {
@@ -176,13 +239,25 @@ public class PlatformRedisStore {
 
     public Mono<Long> getAllowedCount(String tenantId, String clientId) {
         return redisTemplate.opsForValue().get(USAGE_ALLOWED + tenantId + ":" + clientId)
-                .map(Long::parseLong)
+                .flatMap(val -> {
+                    try {
+                        return Mono.just(Long.parseLong(val));
+                    } catch (NumberFormatException e) {
+                        return Mono.just(0L);
+                    }
+                })
                 .defaultIfEmpty(0L);
     }
 
     public Mono<Long> getDeniedCount(String tenantId, String clientId) {
         return redisTemplate.opsForValue().get(USAGE_DENIED + tenantId + ":" + clientId)
-                .map(Long::parseLong)
+                .flatMap(val -> {
+                    try {
+                        return Mono.just(Long.parseLong(val));
+                    } catch (NumberFormatException e) {
+                        return Mono.just(0L);
+                    }
+                })
                 .defaultIfEmpty(0L);
     }
 
@@ -206,5 +281,27 @@ public class PlatformRedisStore {
 
     public static String generateApiKey() {
         return "rlk_" + UUID.randomUUID().toString().replace("-", "");
+    }
+
+    /**
+     * One-way hash for secure storage/lookup of API keys. Raw key never persisted.
+     * Uses unsalted SHA-256 (sufficient here because keys have high entropy from UUID;
+     * a Redis leak would still require brute force against high-entropy values).
+     */
+    public static String hashApiKey(String rawKey) {
+        if (rawKey == null) {
+            return null;
+        }
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hashBytes = digest.digest(rawKey.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(hashBytes.length * 2);
+            for (byte b : hashBytes) {
+                hex.append(String.format("%02x", b));
+            }
+            return hex.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 not available for API key hashing", e);
+        }
     }
 }

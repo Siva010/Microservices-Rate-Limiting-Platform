@@ -8,6 +8,7 @@ import com.platform.platform.service.RateLimitMetricsService;
 import com.platform.platform.service.UsageTrackingService;
 import com.platform.service.RateLimiterService;
 import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.cloud.gateway.filter.GatewayFilter;
 import org.springframework.cloud.gateway.filter.factory.AbstractGatewayFilterFactory;
 import org.springframework.cloud.gateway.route.Route;
@@ -23,6 +24,7 @@ import java.util.Collections;
 import java.util.List;
 
 @Component
+@Slf4j
 public class CustomRateLimiterGatewayFilterFactory
         extends AbstractGatewayFilterFactory<CustomRateLimiterGatewayFilterFactory.Config> {
 
@@ -66,18 +68,26 @@ public class CustomRateLimiterGatewayFilterFactory
                                     resolvedRouteId,
                                     identity.tenantId(),
                                     identity.clientId())
-                                    .doOnNext(result -> recordOutcome(resolvedRouteId, identity, result))
-                                    .flatMap(result -> handleResult(exchange, chain, result, policy.source()))));
+                                    .doOnNext(result -> recordMetrics(resolvedRouteId, identity, result))
+                                    .flatMap(result -> {
+                                        Mono<Void> usageMono = result.allowed()
+                                                ? usageTrackingService.recordAllowed(identity.tenantId(), identity.clientId())
+                                                : usageTrackingService.recordDenied(identity.tenantId(), identity.clientId());
+                                        String safeClientId = maskForLog(identity);
+                                        return usageMono
+                                                .doOnError(err -> log.warn("Failed to record usage tracking for tenant={} client={}: {}",
+                                                        identity.tenantId(), safeClientId, err.getMessage()))
+                                                .onErrorResume(err -> Mono.empty())
+                                                .then(handleResult(exchange, chain, result, policy.source()));
+                                    })));
         };
     }
 
-    private void recordOutcome(String routeId, ClientIdentity identity, RateLimitResult result) {
+    private void recordMetrics(String routeId, ClientIdentity identity, RateLimitResult result) {
         if (result.allowed()) {
             metricsService.recordAllowed(routeId, identity);
-            usageTrackingService.recordAllowed(identity.tenantId(), identity.clientId()).subscribe();
         } else {
             metricsService.recordDenied(routeId, identity);
-            usageTrackingService.recordDenied(identity.tenantId(), identity.clientId()).subscribe();
         }
     }
 
@@ -95,11 +105,11 @@ public class CustomRateLimiterGatewayFilterFactory
     private void applyRateLimitHeaders(org.springframework.http.HttpHeaders headers,
                                        RateLimitResult result,
                                        String policySource) {
-        headers.set("X-RateLimit-Limit", String.valueOf(result.burstCapacity()));
-        headers.set("X-RateLimit-Remaining", String.valueOf(result.remainingTokens()));
+        headers.set("X-RateLimit-Limit", String.valueOf(Math.max(0, result.burstCapacity())));
+        headers.set("X-RateLimit-Remaining", String.valueOf(Math.max(0, result.remainingTokens())));
         headers.set("X-RateLimit-Policy", policySource);
         if (!result.allowed()) {
-            headers.set("Retry-After", String.valueOf(result.retryAfterSeconds()));
+            headers.set("Retry-After", String.valueOf(Math.max(1, result.retryAfterSeconds())));
         }
     }
 
@@ -114,6 +124,18 @@ public class CustomRateLimiterGatewayFilterFactory
         byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
         DataBuffer buffer = exchange.getResponse().bufferFactory().wrap(bytes);
         return exchange.getResponse().writeWith(Mono.just(buffer));
+    }
+
+    private String maskForLog(ClientIdentity identity) {
+        if (identity == null) return "unknown";
+        String id = identity.clientId();
+        if (id == null) return "unknown";
+        // Never log raw secrets; for API keys we now store hashes, but mask anyway
+        if (identity.identityType() == ClientIdentity.IdentityType.API_KEY || id.length() > 12) {
+            int len = id.length();
+            return id.substring(0, Math.min(4, len)) + "****" + (len > 8 ? id.substring(len - 4) : "");
+        }
+        return id;
     }
 
     @Data

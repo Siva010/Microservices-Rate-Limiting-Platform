@@ -18,6 +18,10 @@ public record RateLimitResult(
         if (allowed || replenishRate <= 0) {
             return 0;
         }
-        return Math.max(1, (long) Math.ceil(1.0 / replenishRate));
+        // Conservative minimum wait: on deny path remainingTokens is typically 0 (Lua returns filled before subtract).
+        // Value is a lower-bound estimate; clients should treat it as "at least this long".
+        long needed = Math.max(1L, 1 - remainingTokens);
+        double secondsPerNeeded = needed / (double) replenishRate;
+        return Math.max(1L, (long) Math.ceil(secondsPerNeeded));
     }
 }

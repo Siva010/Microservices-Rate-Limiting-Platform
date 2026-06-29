@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.platform.config.RateLimiterProperties;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
@@ -14,7 +15,6 @@ import reactor.core.scheduler.Schedulers;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 @Service
 @Slf4j
@@ -24,30 +24,53 @@ public class AlertService {
     private final RateLimiterProperties properties;
     private final ObjectMapper objectMapper;
     private final Scheduler alertScheduler;
-    private final ConcurrentHashMap<String, Long> lastAlertTimestamps = new ConcurrentHashMap<>();
+    private final ReactiveStringRedisTemplate redisTemplate;
 
     @Autowired
     public AlertService(KafkaTemplate<String, String> kafkaTemplate,
                         RateLimiterProperties properties,
-                        ObjectMapper objectMapper) {
-        this(kafkaTemplate, properties, objectMapper, Schedulers.boundedElastic());
+                        ObjectMapper objectMapper,
+                        ReactiveStringRedisTemplate redisTemplate) {
+        this(kafkaTemplate, properties, objectMapper, Schedulers.boundedElastic(), redisTemplate);
     }
 
     AlertService(KafkaTemplate<String, String> kafkaTemplate,
                  RateLimiterProperties properties,
                  ObjectMapper objectMapper,
-                 Scheduler alertScheduler) {
+                 Scheduler alertScheduler,
+                 ReactiveStringRedisTemplate redisTemplate) {
         this.kafkaTemplate = kafkaTemplate;
         this.properties = properties;
         this.objectMapper = objectMapper;
         this.alertScheduler = alertScheduler;
+        this.redisTemplate = redisTemplate;
     }
 
     public void publishRateLimitExceededAlert(String routeId, String tenantId, String clientId) {
-        if (!shouldPublishAlert(routeId, tenantId, clientId)) {
+        long debounceSeconds = properties.getKafka().getAlertDebounceSeconds();
+        if (debounceSeconds <= 0) {
+            doPublishAlert(routeId, tenantId, clientId);
             return;
         }
 
+        String debounceKey = "rate-limit-alert-debounce:" + routeId + ":" + tenantId + ":" + clientId;
+        redisTemplate.opsForValue()
+                .setIfAbsent(debounceKey, "1", Duration.ofSeconds(debounceSeconds))
+                .subscribeOn(alertScheduler)
+                .subscribe(
+                        set -> {
+                            if (Boolean.TRUE.equals(set)) {
+                                doPublishAlert(routeId, tenantId, clientId);
+                            }
+                        },
+                        error -> {
+                            log.error("Failed to check alert debounce in Redis, publishing anyway (best-effort)", error);
+                            doPublishAlert(routeId, tenantId, clientId);  // fallback to avoid dropping critical alerts
+                        }
+                );
+    }
+
+    private void doPublishAlert(String routeId, String tenantId, String clientId) {
         String message = buildAlertMessage(routeId, tenantId, clientId);
         log.warn("Publishing alert to Kafka: {}", message);
         Mono.fromRunnable(() -> kafkaTemplate.send(properties.getKafka().getTopic(), clientId, message))
@@ -56,24 +79,6 @@ public class AlertService {
                         null,
                         error -> log.error("Failed to publish rate limit alert to Kafka", error)
                 );
-    }
-
-    boolean shouldPublishAlert(String routeId, String tenantId, String clientId) {
-        long debounceSeconds = properties.getKafka().getAlertDebounceSeconds();
-        if (debounceSeconds <= 0) {
-            return true;
-        }
-
-        String alertKey = routeId + ":" + tenantId + ":" + clientId;
-        long now = System.currentTimeMillis();
-        Long lastAlert = lastAlertTimestamps.get(alertKey);
-
-        if (lastAlert != null && now - lastAlert < Duration.ofSeconds(debounceSeconds).toMillis()) {
-            return false;
-        }
-
-        lastAlertTimestamps.put(alertKey, now);
-        return true;
     }
 
     private String buildAlertMessage(String routeId, String tenantId, String clientId) {

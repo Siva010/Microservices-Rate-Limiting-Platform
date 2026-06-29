@@ -9,8 +9,10 @@ import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.security.Keys;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.stereotype.Component;
+import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Mono;
 
 import javax.crypto.SecretKey;
@@ -48,18 +50,15 @@ public class ClientIdentityResolver {
         return resolveIpFallback(request);
     }
 
-    private Mono<ClientIdentity> resolveApiKey(String apiKey) {
-        return store.findApiKey(apiKey)
+    private Mono<ClientIdentity> resolveApiKey(String rawApiKey) {
+        return store.findApiKey(rawApiKey)
                 .filter(ApiKeyRecord::isEnabled)
                 .map(record -> new ClientIdentity(
                         record.getTenantId(),
-                        apiKey,
+                        record.getKey(),  // use the stored hash (safe identifier), never the raw secret
                         ClientIdentity.IdentityType.API_KEY))
-                .switchIfEmpty(resolveUnknownApiKey(apiKey));
-    }
-
-    private Mono<ClientIdentity> resolveUnknownApiKey(String apiKey) {
-        return Mono.just(new ClientIdentity("unknown", apiKey, ClientIdentity.IdentityType.API_KEY));
+                .switchIfEmpty(Mono.error(new ResponseStatusException(
+                        HttpStatus.UNAUTHORIZED, "Invalid or disabled API key")));
     }
 
     private ClientIdentity resolveJwt(String token) {
